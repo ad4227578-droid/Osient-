@@ -3,6 +3,7 @@ import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from typing import Any
 
 import duckdb
@@ -19,11 +20,11 @@ HF_INDEX_BASE = os.environ.get(
     "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main",
 ).rstrip("/")
 INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
+
+PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "1"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 
-# Render PORT fix (Default to 10000 if not provided)
 PORT = int(os.environ.get("PORT", 10000))
 
 SEARCH_FIELDS = [
@@ -54,6 +55,12 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
+    
+    # ── Strict Memory Control to Prevent 502 Crashes & Enable Caching ──
+    con.execute("SET memory_limit='250MB'")          
+    con.execute("SET enable_http_metadata_cache=true;") 
+    con.execute("SET http_keep_alive=true;")           
+
     for kind, urls in REMOTE_INDEXES.items():
         view = f"people_{kind}"
         lst = ", ".join(f"'{u}'" for u in urls)
@@ -145,7 +152,9 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
 
 
-def _unified_search(q: str, limit: int = 10) -> dict:
+# ── Cached Unified Search for Lightning-Fast Performance ─────────────────────
+@lru_cache(maxsize=1000)
+def _cached_unified_search_str(q: str, limit: int = 10) -> str:
     q = q.strip()
     is_num = q.isdigit() and len(q) >= 8
 
@@ -161,21 +170,21 @@ def _unified_search(q: str, limit: int = 10) -> dict:
             all_rows.extend(r["results"])
             searched.append("aadharNumber")
         all_rows = _cap_duplicates(all_rows)[:limit]
-        return {
+        res = {
             "query": q, "searched_fields": searched,
             "count": len(all_rows), "results": all_rows,
         }
     else:
-        return {"query": q, "searched_fields": [], "count": 0, "results": []}
+        res = {"query": q, "searched_fields": [], "count": 0, "results": []}
+    return json.dumps(res, ensure_ascii=False)
+
+
+def _unified_search(q: str, limit: int = 10) -> dict:
+    return json.loads(_cached_unified_search_str(q, limit))
 
 
 # ── FastAPI ─────────────────────────────────────────────────────────────────
 fastapi_app = FastAPI(title="ICMR + HITEK Search API")
-
-
-class BatchRequest(BaseModel):
-    queries: list[dict[str, Any]]
-    limit: int = 10
 
 
 @fastapi_app.get("/")
@@ -187,7 +196,7 @@ def root():
         "index_source": INDEX_SOURCE,
         "columns": SEARCH_FIELDS,
         "docs": "/docs",
-        "developer": "@nexunx",   # <-- Updated here
+        "developer": "@nexunx",
     }
 
 
@@ -216,7 +225,7 @@ async def search(
     else:
         data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
     
-    # Redact or mask any sensitive ID fields in the JSON response output just in case
+    # Securely redact sensitive identifier numbers from output responses
     for r in data.get("results", []):
         if "aadharNumber" in r and r["aadharNumber"]:
             r["aadharNumber"] = "[Redacted]"
@@ -252,7 +261,6 @@ def format_result(row: dict) -> str:
     for field in SEARCH_FIELDS:
         val = row.get(field, "")
         if val:
-            # Masking sensitive ID display in UI
             if field == "aadharNumber":
                 val = "[Redacted]"
             lines.append(f"**{field}:** {val}")
@@ -265,7 +273,7 @@ def format_result(row: dict) -> str:
 
 def search_ui(query: str, limit: int) -> str:
     if not query or not query.strip():
-        return "⚠️ Kuch toh search karo — phone, aadhar, ya name daalo."
+        return "⚠️ Kuch toh search karo — phone number daalo."
     q = query.strip()
     try:
         data = _unified_search(q, int(limit))
@@ -289,10 +297,10 @@ def search_ui(query: str, limit: int) -> str:
 def build_ui():
     with gr.Blocks(title="ICMR Search API", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# 🔍 ICMR + HITEK Search API")
-        gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name, address & more")
+        gr.Markdown("Search **2.5 billion records** instantly with caching & stability")
 
         with gr.Row():
-            query_input = gr.Textbox(label="Search Query", placeholder="Phone number, Aadhaar, ya name daalo...", lines=1)
+            query_input = gr.Textbox(label="Search Query", placeholder="Phone number daalo...", lines=1)
             limit_slider = gr.Slider(minimum=1, maximum=50, value=10, step=1, label="Max Results")
 
         search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
@@ -301,7 +309,6 @@ def build_ui():
         search_btn.click(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
         query_input.submit(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
 
-        # Updated Developer Tag Footer
         gr.Markdown(
             "---\n<div style='text-align: center;'>👨‍💻 **Developer:** @nexunx</div>"
         )
@@ -311,6 +318,5 @@ def build_ui():
 demo = build_ui()
 app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 
-# ── Server Startup Fix for Render ───────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
