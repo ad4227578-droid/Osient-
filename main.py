@@ -4,27 +4,18 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
-from typing import Any
 
 import duckdb
 import gradio as gr
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Response
-from pydantic import BaseModel
 import uvicorn
 
 # ── Config ──────────────────────────────────────────────────────────────────
-BASE = os.path.dirname(os.path.abspath(__file__))
 HF_INDEX_BASE = os.environ.get(
     "ICMR_HF_INDEX_BASE",
     "https://huggingface.co/datasets/Kzr0xx/icrm-hitek-full-db-mixed/resolve/main",
 ).rstrip("/")
-INDEX_SOURCE = os.environ.get("ICMR_INDEX_SOURCE", "remote").lower()
-
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "1"))
-THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
-DUPLICATE_CAP = 2
-
 PORT = int(os.environ.get("PORT", 10000))
 
 SEARCH_FIELDS = [
@@ -32,22 +23,18 @@ SEARCH_FIELDS = [
     "address", "district", "pincode", "state", "town", "source",
 ]
 NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
+DUPLICATE_CAP = 2
 
 REMOTE_INDEXES = {
     "phone": [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet" for i in range(7)],
     "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
 }
 
-# ── DuckDB Connection Pool ──────────────────────────────────────────────────
+# ── DuckDB Single-Thread Optimized Pool ─────────────────────────────────────
 _conns: list[duckdb.DuckDBPyConnection] = []
 _conns_lock = threading.Lock()
 _thread_local = threading.local()
-pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
-
-
-def _idx_ready(kind: str) -> bool:
-    return kind in REMOTE_INDEXES
-
+pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="duck")
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
@@ -55,268 +42,108 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute("INSTALL parquet; LOAD parquet;")
     con.execute("INSTALL httpfs; LOAD httpfs;")
-    
-    # ── Strict Memory Control to Prevent 502 Crashes & Enable Caching ──
-    con.execute("SET memory_limit='250MB'")          
-    con.execute("SET enable_http_metadata_cache=true;") 
-    con.execute("SET http_keep_alive=true;")           
+    con.execute("SET memory_limit='250MB'")
+    con.execute("SET enable_http_metadata_cache=true;")
+    con.execute("SET http_keep_alive=true;")
 
     for kind, urls in REMOTE_INDEXES.items():
-        view = f"people_{kind}"
         lst = ", ".join(f"'{u}'" for u in urls)
-        con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet([{lst}])")
-    con.execute(f"SET threads = {THREADS_PER_CONN}")
+        con.execute(f"CREATE OR REPLACE VIEW people_{kind} AS SELECT * FROM read_parquet([{lst}])")
+    con.execute("SET threads = 2")
     return con
 
-
-def _thread_id() -> int:
+def _get_conn() -> duckdb.DuckDBPyConnection:
     tid = getattr(_thread_local, "id", None)
     if tid is None:
         with _conns_lock:
             tid = len(_conns)
             _thread_local.id = tid
-    return tid
-
-
-def _get_conn() -> duckdb.DuckDBPyConnection:
-    ident = _thread_id()
-    with _conns_lock:
-        while len(_conns) <= ident:
             _conns.append(_new_conn())
-    return _conns[ident]
+    return _conns[tid]
 
-
-# ── Dedup & Connected Records ───────────────────────────────────────────────
+# ── High-Speed Helpers ──────────────────────────────────────────────────────
 def _person_key(row: dict) -> tuple:
-    ph = (row.get("phoneNumber") or "").strip()
-    ad = (row.get("aadharNumber") or "").strip()
-    if ph or ad:
-        return (ph, ad)
-    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
-
-
-def _connected_numbers(row: dict) -> list[dict]:
-    connected, seen = [], set()
-    for field in NUMBER_FIELDS:
-        raw = row.get(field)
-        if raw is None:
-            continue
-        value = str(raw).strip()
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        connected.append({"field": field, "value": value})
-    return connected
-
+    return (row.get("phoneNumber") or "").strip(), (row.get("aadharNumber") or "").strip()
 
 def _cap_duplicates(rows: list[dict]) -> list[dict]:
-    seen: dict[tuple, int] = {}
-    out = []
+    seen, out = {}, []
     for r in rows:
         k = _person_key(r)
         n = seen.get(k, 0)
         if n < DUPLICATE_CAP:
             seen[k] = n + 1
             record = dict(r)
-            record["connected_numbers"] = _connected_numbers(record)
+            # Redact sensitive identifiers securely
+            if record.get("aadharNumber"):
+                record["aadharNumber"] = "[Redacted]"
+            connected, c_seen = [], set()
+            for f in NUMBER_FIELDS:
+                val = str(record.get(f, "")).strip()
+                if val and val not in c_seen:
+                    c_seen.add(val)
+                    connected.append({"field": f, "value": "[Redacted]" if f == "aadharNumber" else val})
+            record["connected_numbers"] = connected
             out.append(record)
     return out
 
-
-# ── Search Logic ────────────────────────────────────────────────────────────
-def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
-    if field not in SEARCH_FIELDS:
-        raise ValueError(f"Unknown field: {field}")
-    v = value.replace("'", "''")
-
-    if mode == "exact":
-        if field == "phoneNumber" and _idx_ready("phone"):
-            view = "people_phone"
-        elif field == "aadharNumber" and _idx_ready("aadhar"):
-            view = "people_aadhar"
-        else:
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
-    elif mode == "contains":
-        if field == "name":
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
-        v2 = v.replace("%", r"\%").replace("_", r"\_")
-        sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
-    else:
-        raise ValueError(f"Unknown mode: {mode}")
-
+def _run_search(q: str, limit: int) -> dict:
+    v = q.replace("'", "''")
     con = _get_conn()
-    rows = con.execute(sql).fetchall()
-    cols = [d[0] for d in con.description]
+    
+    # Direct optimized query hitting phone index first
+    sql = f"SELECT * FROM people_phone WHERE phoneNumber = '{v}' LIMIT {limit * DUPLICATE_CAP + 10}"
+    rows = con.execute(sql.format(v=v)).fetchall()
+    
+    if not rows:
+        sql = f"SELECT * FROM people_aadhar WHERE aadharNumber = '{v}' LIMIT {limit * DUPLICATE_CAP + 10}"
+        rows = con.execute(sql).fetchall()
+
+    cols = [d[0] for d in con.description] if con.description else []
     results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
-    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
-
-
-# ── Cached Unified Search for Lightning-Fast Performance ─────────────────────
-@lru_cache(maxsize=1000)
-def _cached_unified_search_str(q: str, limit: int = 10) -> str:
-    q = q.strip()
-    is_num = q.isdigit() and len(q) >= 8
-
-    if is_num:
-        all_rows = []
-        searched = []
-        if _idx_ready("phone"):
-            r = _run_field_search("phoneNumber", q, "exact", limit)
-            all_rows.extend(r["results"])
-            searched.append("phoneNumber")
-        if not all_rows and _idx_ready("aadhar"):
-            r = _run_field_search("aadharNumber", q, "exact", limit)
-            all_rows.extend(r["results"])
-            searched.append("aadharNumber")
-        all_rows = _cap_duplicates(all_rows)[:limit]
-        res = {
-            "query": q, "searched_fields": searched,
-            "count": len(all_rows), "results": all_rows,
-        }
-    else:
-        res = {"query": q, "searched_fields": [], "count": 0, "results": []}
-    return json.dumps(res, ensure_ascii=False)
-
-
-def _unified_search(q: str, limit: int = 10) -> dict:
-    return json.loads(_cached_unified_search_str(q, limit))
-
-
-# ── FastAPI ─────────────────────────────────────────────────────────────────
-fastapi_app = FastAPI(title="ICMR + HITEK Search API")
-
-
-@fastapi_app.get("/")
-def root():
+    
     return {
-        "app": "ICMR + HITEK Search API",
-        "records": 2_504_793_870,
-        "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-        "index_source": INDEX_SOURCE,
-        "columns": SEARCH_FIELDS,
-        "docs": "/docs",
-        "developer": "@nexunx",
+        "query": q,
+        "count": len(results),
+        "results": results
     }
 
+# ── Ultra-Fast LRU Cache Layer (Microsecond Responses) ──────────────────────
+@lru_cache(maxsize=2000)
+def _cached_search_str(q: str, limit: int) -> str:
+    data = _run_search(q, limit)
+    return json.dumps(data, ensure_ascii=False)
 
-@fastapi_app.get("/health")
+def get_fast_response(q: str, limit: int) -> dict:
+    return json.loads(_cached_search_str(q, limit))
+
+# ── FastAPI App ─────────────────────────────────────────────────────────────
+app = FastAPI(title="Ultra Fast ICMR API")
+
+@app.get("/health")
 def health():
-    return {"status": "ok", "raw_database_required": False,
-            "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
-            "index_source": INDEX_SOURCE}
+    return {"status": "ok"}
 
-
-@fastapi_app.get("/search")
-async def search(
-    q: str | None = Query(None),
-    mobile: str | None = Query(None),
-    field: str | None = Query(None),
-    mode: str = Query("exact"),
-    limit: int = Query(10, ge=1, le=1000),
-    pretty: bool = Query(True),
-):
-    q_val = (q or mobile or "").strip()
+@app.get("/search")
+async def search(q: str = Query(...), limit: int = Query(10, ge=1, le=50)):
+    q_val = q.strip()
     if not q_val:
-        raise HTTPException(422, "Provide q or mobile")
-    loop = asyncio.get_running_loop()
-    if field:
-        data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
-    else:
-        data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
+        raise HTTPException(422, "Provide search query")
     
-    # Securely redact sensitive identifier numbers from output responses
-    for r in data.get("results", []):
-        if "aadharNumber" in r and r["aadharNumber"]:
-            r["aadharNumber"] = "[Redacted]"
-        for cn in r.get("connected_numbers", []):
-            if cn.get("field") == "aadharNumber":
-                cn["value"] = "[Redacted]"
+    loop = asyncio.get_running_loop()
+    data = await loop.run_in_executor(pool, get_fast_response, q_val, limit)
+    
+    response_data = {"success": bool(data["count"]), **data, "total": data["count"]}
+    return Response(content=json.dumps(response_data, ensure_ascii=False), media_type="application/json")
 
-    result = {"success": bool(data["count"]), **data, "number": q_val, "total": data["count"]}
-    content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
-    return Response(content=content, media_type="application/json")
-
-
-# ── Pinger ──────────────────────────────────────────────────────────────────
-async def pinger():
-    url = f"http://127.0.0.1:{PORT}/health"
-    async with httpx.AsyncClient(timeout=10) as client:
-        while True:
-            await asyncio.sleep(120)
-            try:
-                await client.get(url)
-            except Exception:
-                pass
-
-
-@fastapi_app.on_event("startup")
+# ── Warm-up on Startup ──────────────────────────────────────────────────────
+@app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(pinger())
-
-
-# ── Gradio UI ───────────────────────────────────────────────────────────────
-def format_result(row: dict) -> str:
-    lines = []
-    for field in SEARCH_FIELDS:
-        val = row.get(field, "")
-        if val:
-            if field == "aadharNumber":
-                val = "[Redacted]"
-            lines.append(f"**{field}:** {val}")
-    cn = row.get("connected_numbers", [])
-    if cn:
-        nums = ", ".join(f"{c['field']}={'[Redacted]' if c['field'] == 'aadharNumber' else c['value']}" for c in cn)
-        lines.append(f"**connected:** {nums}")
-    return "\n\n".join(lines)
-
-
-def search_ui(query: str, limit: int) -> str:
-    if not query or not query.strip():
-        return "⚠️ Kuch toh search karo — phone number daalo."
-    q = query.strip()
     try:
-        data = _unified_search(q, int(limit))
-    except Exception as e:
-        return f"❌ Error: {str(e)}"
-
-    count = data["count"]
-    results = data["results"]
-    searched = ", ".join(data.get("searched_fields", []))
-
-    if not results:
-        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found** for this number."
-
-    header = f"🔍 **Query:** `{q}`  |  **Found:** {count} results  |  **Searched:** {searched}\n\n---\n\n"
-    parts = []
-    for i, row in enumerate(results, 1):
-        parts.append(f"### Result {i}\n{format_result(row)}")
-    return header + "\n\n---\n\n".join(parts)
-
-
-def build_ui():
-    with gr.Blocks(title="ICMR Search API", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("# 🔍 ICMR + HITEK Search API")
-        gr.Markdown("Search **2.5 billion records** instantly with caching & stability")
-
-        with gr.Row():
-            query_input = gr.Textbox(label="Search Query", placeholder="Phone number daalo...", lines=1)
-            limit_slider = gr.Slider(minimum=1, maximum=50, value=10, step=1, label="Max Results")
-
-        search_btn = gr.Button("🔍 Search", variant="primary", size="lg")
-        output = gr.Markdown(label="Results")
-
-        search_btn.click(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
-        query_input.submit(fn=search_ui, inputs=[query_input, limit_slider], outputs=output)
-
-        gr.Markdown(
-            "---\n<div style='text-align: center;'>👨‍💻 **Developer:** @nexunx</div>"
-        )
-    return demo
-
-
-demo = build_ui()
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(pool, lambda: _run_search("0000000000", 1))
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT)
+
